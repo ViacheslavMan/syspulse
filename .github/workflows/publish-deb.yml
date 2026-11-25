@@ -1,0 +1,91 @@
+name: Build & Publish syspulse .deb to Nexus (APT)
+
+on:
+  push:
+    branches: ["release"]
+  workflow_dispatch:
+
+env:
+  GO_VERSION: "1.21"
+
+jobs:
+  build-publish-verify:
+    runs-on: self-hosted
+    env:
+      NEXUS_HOST: ${{ secrets.NEXUS_HOST }}
+      NEXUS_USER: ${{ secrets.NEXUS_USER }}
+      NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Build static Linux binary
+        run: |
+          mkdir -p dist
+          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o dist/syspulse .
+          ls -lh dist/syspulse
+
+      - name: Package as .deb
+        id: pack
+        run: |
+          export COPYFILE_DISABLE=1
+          PKG=syspulse
+          VER=$(sed -n 's/^const Version = "\([0-9.]*\)".*/\1/p' main.go)
+          echo "Building ${PKG} version ${VER}"
+          ROOT=build/${PKG}_${VER}
+          rm -rf build
+          mkdir -p "${ROOT}/DEBIAN" "${ROOT}/usr/bin"
+          cp dist/syspulse "${ROOT}/usr/bin/${PKG}"
+          chmod 755 "${ROOT}/usr/bin/${PKG}"
+          {
+            echo "Package: ${PKG}"
+            echo "Version: ${VER}"
+            echo "Section: utils"
+            echo "Priority: optional"
+            echo "Architecture: amd64"
+            echo "Maintainer: DevOps Team <devops@example.com>"
+            echo "Depends: libc6 (>= 2.17)"
+            echo "Description: Lightweight CLI tool for a system health snapshot"
+            echo " Reads /proc and reports uptime, load average and memory info."
+          } > "${ROOT}/DEBIAN/control"
+          dpkg-deb --build --root-owner-group "${ROOT}" "dist/${PKG}_${VER}_amd64.deb"
+          dpkg -I "dist/${PKG}_${VER}_amd64.deb"
+          echo "deb_path=dist/${PKG}_${VER}_amd64.deb" >> "$GITHUB_OUTPUT"
+
+      - name: Upload .deb to Nexus (APT deploy)
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error \
+            --user "${NEXUS_USER}:${NEXUS_PASSWORD}" \
+            -X POST \
+            -H "Content-Type: multipart/form-data" \
+            --data-binary "@${{ steps.pack.outputs.deb_path }}" \
+            "http://${NEXUS_HOST}:8081/repository/syspulse/"
+          echo "Package uploaded to Nexus"
+
+      - name: Verify install via apt in Ubuntu container
+        run: |
+          set -euo pipefail
+          sleep 15
+          docker run --rm --platform linux/amd64 -e NEXUS_HOST ubuntu:22.04 bash -c '
+            set -euo pipefail
+            echo "deb [trusted=yes] http://${NEXUS_HOST}:8081/repository/syspulse/ stable main" > /etc/apt/sources.list.d/syspulse.list
+            apt-get update
+            apt-get install -y syspulse
+            dpkg -s syspulse | grep -E "^(Package|Version|Architecture)"
+            syspulse --version
+            syspulse
+          '
+
+      - name: Save .deb as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: syspulse-deb
+          path: dist/*.deb
+          retention-days: 7
